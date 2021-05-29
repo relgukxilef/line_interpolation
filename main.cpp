@@ -32,22 +32,29 @@ struct context {
     context() = default;
 
     operation* current_operation;
-    glm::mat3 view_matrix;
-    unsigned int width, height;
+    ge1::span<glm::vec2> positions;
+    glm::mat3x2 view_matrix;
+    unsigned width, height;
 };
+
+glm::vec2 to_canvas(context &c, glm::vec2 screen_position) {
+    auto ndc = 2.f * screen_position / glm::vec2(c.width, c.height) - 1.f;
+    ndc.y = -ndc.y;
+    return ndc - c.view_matrix[2];
+}
 
 struct operation {
     operation() = default;
     virtual ~operation() = default;
 
     virtual void trigger(context &c, double x, double y) = 0;
-    virtual void mouse_move_event(context &c, double x, double y) {};
+    virtual void mouse_move_event(context &c, double x, double y) = 0;
     virtual void mouse_button_event(
         context &c, int button, int action, int modifiers
-    ) {};
+    ) = 0;
     virtual void key_event(
         context &c, int key, int scancode, int modifiers
-    ) {};
+    ) = 0;
 };
 
 struct pan_operation : public operation {
@@ -64,21 +71,57 @@ struct pan_operation : public operation {
 
         offset = position;
     }
+    void mouse_button_event(context &c, int, int action, int) override {
+        if (action == GLFW_RELEASE) {
+            c.current_operation = nullptr;
+        }
+    }
+    void key_event(context &, int, int, int) override {}
+
+    glm::vec2 offset;
+};
+
+struct drag_operation : public operation {
+    void trigger(context &c, double x, double y) override {
+        old_position = to_canvas(c, {x, y});
+
+        float closest_distance = 1.0f;
+
+        for (glm::vec2 &point : c.positions) {
+            auto offset = point - old_position;
+            auto distance = dot(offset, offset);
+            if (distance < closest_distance * closest_distance) {
+                c.current_operation = this;
+                closest_distance = distance;
+                index = &point - c.positions.begin();
+            }
+        }
+    }
+    void mouse_move_event(context &c, double x, double y) override {
+        glm::vec2 position = to_canvas(c, {x, y});
+        auto delta = position - old_position;
+
+        c.positions[index] += delta;
+
+        old_position = position;
+    }
     void mouse_button_event(
-        context &c, int button, int action, int modifiers
+        context &c, int, int action, int
     ) override {
         if (action == GLFW_RELEASE) {
             c.current_operation = nullptr;
         }
     }
+    void key_event(context &, int, int, int) override {}
 
-    glm::vec2 offset;
+    glm::vec2 old_position;
+    unsigned index;
 };
 
-static unique_glfw* glfw;
 static context* current_context;
 
 static pan_operation pan_operation;
+static drag_operation drag_operation;
 
 void mouse_button_callback(
     GLFWwindow* window, int button, int action, int modifiers
@@ -100,14 +143,12 @@ void mouse_button_callback(
             if (button == GLFW_MOUSE_BUTTON_LEFT) {
                 // current_operation = &rotate_view_operation;
             } else if (button == GLFW_MOUSE_BUTTON_MIDDLE) {
-                current_context->current_operation = &pan_operation;
+                pan_operation.trigger(*current_context, x, y);
             } else if (button == GLFW_MOUSE_BUTTON_RIGHT) {
                 // current_operation = &dolly_view_operation;
             }
-        }
-
-        if (current_context->current_operation) {
-            current_context->current_operation->trigger(*current_context, x, y);
+        } else {
+            drag_operation.trigger(*current_context, x, y);
         }
     }
 }
@@ -127,15 +168,19 @@ void window_size_callback(GLFWwindow*, int width, int height) {
     glViewport(0, 0, width, height);
 }
 
+glm::vec2 square_positions[]{{-1, -1}, {1, -1}, {-1, 1}, {1, 1}};
+unsigned short square_triangles[]{0, 1, 2, 2, 1, 3};
+
 int main() {
     unique_glfw glfw;
-    ::glfw = &glfw;
 
     GLFWwindow* window;
 
     glfwWindowHint(GLFW_SAMPLES, 8);
     glfwWindowHint(GLFW_MAXIMIZED , GL_TRUE);
     glfwSwapInterval(1);
+
+    context c;
 
     GLFWmonitor *monitor = glfwGetPrimaryMonitor();
     const GLFWvidmode *mode = glfwGetVideoMode(monitor);
@@ -177,14 +222,17 @@ int main() {
         GL_COPY_WRITE_BUFFER, position_capacity * sizeof(glm::vec2), nullptr,
         GL_MAP_COHERENT_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_WRITE_BIT
     );
-    auto positions = reinterpret_cast<glm::vec2*>(glMapBufferRange(
-        GL_COPY_WRITE_BUFFER, 0, position_capacity * sizeof(glm::vec2),
-        GL_MAP_COHERENT_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_WRITE_BIT
-    ));
+    {
+        auto positions = reinterpret_cast<glm::vec2*>(glMapBufferRange(
+            GL_COPY_WRITE_BUFFER, 0, position_capacity * sizeof(glm::vec2),
+            GL_MAP_COHERENT_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_WRITE_BIT
+        ));
+        c.positions = {positions, positions + position_capacity};
+    }
 
-    positions[0] = {0, 0};
-    positions[1] = {0.1, 0.1};
-    positions[2] = {0.2, 0.1};
+    c.positions[0] = {0, 0};
+    c.positions[1] = {0.1, 0.1};
+    c.positions[2] = {0.2, 0.1};
 
     glBindBuffer(GL_COPY_WRITE_BUFFER, line_buffer);
     glBufferStorage(
@@ -196,9 +244,9 @@ int main() {
         GL_MAP_COHERENT_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_WRITE_BIT
     ));
 
-    positions[0] = {0, 0};
-    positions[1] = {0.1, 0.1};
-    positions[2] = {0.2, 0.1};
+    c.positions[0] = {0, 0};
+    c.positions[1] = {0.1, 0.1};
+    c.positions[2] = {0.2, 0.1};
 
     lines[0] = 0;
     lines[1] = 1;
@@ -210,7 +258,8 @@ int main() {
     };
 
     ge1::unique_program program = ge1::compile_program(
-        "shader/position_vertex.glsl", nullptr, nullptr, nullptr, nullptr, {},
+        "shader/position_vertex.glsl", nullptr, nullptr, nullptr,
+        "shader/lines_fragment.glsl", {},
         {{"position", position_location}}
     );
 
@@ -220,13 +269,12 @@ int main() {
         program.get_name(), {{"view_matrix", &view_matrix_location}}
     );
 
-    context c;
     current_context = &c;
     c.current_operation = nullptr;
     c.view_matrix = {
-        1.0, 0.0, 0.0,
-        0.0, 1.0, 0.0,
-        0.0, 0.0, 1.0
+        1.0, 0.0,
+        0.0, 1.0,
+        0.0, 0.0,
     };
 
     glfwSetCursorPosCallback(window, &cursor_position_callback);
@@ -242,7 +290,7 @@ int main() {
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
         glUseProgram(program.get_name());
-        glUniformMatrix3fv(
+        glUniformMatrix3x2fv(
             view_matrix_location, 1, GL_FALSE, glm::value_ptr(c.view_matrix)
         );
         glBindVertexArray(line_array.get_name());
