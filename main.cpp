@@ -10,13 +10,10 @@
 #include "ge1/vertex_array.h"
 #include "ge1/program.h"
 
-using namespace std;
-using namespace glm;
-
 struct unique_glfw {
     unique_glfw() {
         if (!glfwInit()) {
-            throw runtime_error("Couldn't initialize GLFW!");
+            throw std::runtime_error("couldn't initialize GLFW");
         }
     }
 
@@ -33,14 +30,17 @@ struct context {
 
     operation* current_operation;
     ge1::span<glm::vec2> positions;
+
+    glm::vec2 view_center, view_right;
     glm::mat3x2 view_matrix;
+
     unsigned width, height;
 };
 
 glm::vec2 to_canvas(context &c, glm::vec2 screen_position) {
     auto ndc = 2.f * screen_position / glm::vec2(c.width, c.height) - 1.f;
     ndc.y = -ndc.y;
-    return ndc - c.view_matrix[2];
+    return glm::inverse(glm::mat2(c.view_matrix)) * (ndc - c.view_center);
 }
 
 struct operation {
@@ -66,8 +66,9 @@ struct pan_operation : public operation {
         glm::vec2 position = glm::vec2{x, y};
         auto delta = position - offset;
 
-        c.view_matrix[2].x += 2 * delta.x / c.width;
-        c.view_matrix[2].y -= 2 * delta.y / c.height;
+        c.view_center.x += 2 * delta.x / c.width;
+        c.view_center.y -= 2 * delta.y / c.height;
+        c.view_matrix[2] = c.view_center;
 
         offset = position;
     }
@@ -162,8 +163,17 @@ void cursor_position_callback(GLFWwindow*, double x, double y) {
 }
 
 void window_size_callback(GLFWwindow*, int width, int height) {
-    current_context->width = static_cast<unsigned int>(width);
-    current_context->height = static_cast<unsigned int>(height);
+    auto &c = *current_context;
+
+    c.width = static_cast<unsigned int>(width);
+    c.height = static_cast<unsigned int>(height);
+
+    float aspect_ratio = static_cast<float>(c.width) / c.height;
+    c.view_matrix = {
+        c.view_right.x, c.view_right.y * aspect_ratio,
+        -c.view_right.y, c.view_right.x * aspect_ratio,
+        c.view_center.x, c.view_center.y,
+    };
 
     glViewport(0, 0, width, height);
 }
@@ -271,11 +281,7 @@ int main() {
 
     current_context = &c;
     c.current_operation = nullptr;
-    c.view_matrix = {
-        1.0, 0.0,
-        0.0, 1.0,
-        0.0, 0.0,
-    };
+
 
     glfwSetCursorPosCallback(window, &cursor_position_callback);
     glfwSetMouseButtonCallback(window, &mouse_button_callback);
@@ -284,6 +290,15 @@ int main() {
     int width, height;
     glfwGetWindowSize(window, &width, &height);
     window_size_callback(window, width, height);
+
+    c.view_center = glm::vec2(0);
+    c.view_right = glm::vec2(1, 0);
+    float aspect_ratio = static_cast<float>(c.width) / c.height;
+    c.view_matrix = {
+        c.view_right.x, c.view_right.y * aspect_ratio,
+        -c.view_right.y, c.view_right.x * aspect_ratio,
+        c.view_center.x, c.view_center.y,
+    };
 
     while (!glfwWindowShouldClose(window)) {
         glClearColor(255, 255, 255, 255);
