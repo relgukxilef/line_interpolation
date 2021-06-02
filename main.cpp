@@ -30,6 +30,9 @@ struct context {
 
     operation* current_operation;
     ge1::span<glm::vec2> positions;
+    ge1::span<unsigned short> lines;
+    unsigned positions_count;
+    unsigned lines_count;
 
     glm::vec2 view_center, view_right;
     glm::mat3x2 view_matrix;
@@ -88,13 +91,14 @@ struct drag_operation : public operation {
 
         float closest_distance = 1.0f;
 
-        for (glm::vec2 &point : c.positions) {
+        for (unsigned i = 0; i < c.positions_count; i++) {
+            glm::vec2 point = c.positions[i];
             auto offset = point - old_position;
             auto distance = dot(offset, offset);
-            if (distance < closest_distance * closest_distance) {
+            if (distance < closest_distance) {
                 c.current_operation = this;
                 closest_distance = distance;
-                index = &point - c.positions.begin();
+                index = i;
             }
         }
     }
@@ -119,10 +123,23 @@ struct drag_operation : public operation {
     unsigned index;
 };
 
+struct add_vertex : public operation {
+    void trigger(context& c, double x, double y) override {
+        glm::vec2 position = to_canvas(c, {x, y});
+        c.lines[c.lines_count++] = c.positions_count - 1;
+        c.lines[c.lines_count++] = c.positions_count;
+        c.positions[c.positions_count++] = position;
+    }
+    void mouse_move_event(context&, double, double) override {}
+    void mouse_button_event(context&, int, int, int) override {}
+    void key_event(context&, int, int, int) override {}
+};
+
 static context* current_context;
 
 static pan_operation pan_operation;
 static drag_operation drag_operation;
+static add_vertex add_vertex_operation;
 
 void mouse_button_callback(
     GLFWwindow* window, int button, int action, int modifiers
@@ -139,6 +156,7 @@ void mouse_button_callback(
         if (modifiers & GLFW_MOD_SHIFT) {
 
         } else if (modifiers & GLFW_MOD_CONTROL) {
+            add_vertex_operation.trigger(*current_context, x, y);
 
         } else if (modifiers & GLFW_MOD_ALT) {
             if (button == GLFW_MOUSE_BUTTON_LEFT) {
@@ -244,24 +262,31 @@ int main() {
     c.positions[1] = {0.1, 0.1};
     c.positions[2] = {0.2, 0.1};
 
+    c.positions_count = 3;
+
     glBindBuffer(GL_COPY_WRITE_BUFFER, line_buffer);
     glBufferStorage(
         GL_COPY_WRITE_BUFFER, line_capacity * sizeof(glm::vec2), nullptr,
         GL_MAP_COHERENT_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_WRITE_BIT
     );
-    auto lines = reinterpret_cast<unsigned short*>(glMapBufferRange(
-        GL_COPY_WRITE_BUFFER, 0, line_capacity * sizeof(unsigned short),
-        GL_MAP_COHERENT_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_WRITE_BIT
-    ));
+    {
+        auto lines = reinterpret_cast<unsigned short*>(glMapBufferRange(
+            GL_COPY_WRITE_BUFFER, 0, line_capacity * sizeof(unsigned short),
+            GL_MAP_COHERENT_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_WRITE_BIT
+        ));
+        c.lines = {lines, lines + line_capacity};
+    }
 
     c.positions[0] = {0, 0};
     c.positions[1] = {0.1, 0.1};
     c.positions[2] = {0.2, 0.1};
 
-    lines[0] = 0;
-    lines[1] = 1;
-    lines[2] = 1;
-    lines[3] = 2;
+    c.lines[0] = 0;
+    c.lines[1] = 1;
+    c.lines[2] = 1;
+    c.lines[3] = 2;
+
+    c.lines_count = 4;
 
     enum : GLuint {
         position_location,
@@ -309,7 +334,9 @@ int main() {
             view_matrix_location, 1, GL_FALSE, glm::value_ptr(c.view_matrix)
         );
         glBindVertexArray(line_array.get_name());
-        glDrawElements(GL_LINES, 4, GL_UNSIGNED_SHORT, 0);
+        glDrawElements(GL_LINES, c.lines_count, GL_UNSIGNED_SHORT, 0);
+
+        glFinish();
 
         glfwSwapBuffers(window);
 
