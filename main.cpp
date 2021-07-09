@@ -9,6 +9,8 @@
 
 #include "ge1/vertex_array.h"
 #include "ge1/program.h"
+#include "ge1/resources.h"
+#include "ge1/algorithm.h"
 
 struct unique_glfw {
     unique_glfw() {
@@ -29,10 +31,13 @@ struct context {
     context() = default;
 
     operation* current_operation;
-    ge1::span<glm::vec2> positions;
-    ge1::span<unsigned short> lines;
-    unsigned positions_count;
-    unsigned lines_count;
+    ge1::span<glm::vec2> vertices_position;
+    ge1::span<unsigned short> vertices_selection;
+    ge1::span<unsigned short> lines_vertex;
+    ge1::span<unsigned short> selection_vertex;
+    unsigned vertex_count;
+    unsigned line_count;
+    unsigned selection_count;
 
     glm::vec2 view_center, view_right;
     glm::mat3x2 view_matrix;
@@ -40,10 +45,54 @@ struct context {
     unsigned width, height;
 };
 
+void add_vertex(context& c) {
+    assert(c.vertex_count <= c.vertices_position.size());
+
+    ge1::permutation_push_back(
+        c.vertices_selection, c.selection_vertex, c.vertex_count
+    );
+
+    c.vertex_count++;
+}
+
+template<class T>
+ge1::unique_buffer allocate_buffer(unsigned size, ge1::span<T>& data) {
+    GLuint name;
+    glCreateBuffers(1, &name);
+    glBindBuffer(GL_ARRAY_BUFFER, name);
+    glBufferStorage(
+        GL_COPY_WRITE_BUFFER, size * sizeof(T), nullptr,
+        GL_MAP_COHERENT_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_WRITE_BIT
+    );
+    auto begin = reinterpret_cast<T*>(glMapBufferRange(
+        GL_COPY_WRITE_BUFFER, 0, size * sizeof(T),
+        GL_MAP_COHERENT_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_WRITE_BIT
+    ));
+    data = {begin, begin + size};
+    return {name};
+}
+
 glm::vec2 to_canvas(context &c, glm::vec2 screen_position) {
     auto ndc = 2.f * screen_position / glm::vec2(c.width, c.height) - 1.f;
     ndc.y = -ndc.y;
     return glm::inverse(glm::mat2(c.view_matrix)) * (ndc - c.view_center);
+}
+
+unsigned get_closest_vertex(context &c, glm::vec2 position) {
+    auto offset = c.vertices_position[0] - position;
+    float closest_distance = dot(offset, offset);
+    auto index = 0;
+
+    for (unsigned i = 1; i < c.vertex_count; i++) {
+        auto offset = c.vertices_position[i] - position;
+        auto distance = dot(offset, offset);
+        if (distance < closest_distance) {
+            closest_distance = distance;
+            index = i;
+        }
+    }
+
+    return index;
 }
 
 struct operation {
@@ -87,26 +136,18 @@ struct pan_operation : public operation {
 
 struct drag_operation : public operation {
     void trigger(context &c, double x, double y) override {
-        old_position = to_canvas(c, {x, y});
+        if (c.vertex_count > 0) {
+            c.current_operation = this;
+            old_position = to_canvas(c, {x, y});
 
-        float closest_distance = 1.0f;
-
-        for (unsigned i = 0; i < c.positions_count; i++) {
-            glm::vec2 point = c.positions[i];
-            auto offset = point - old_position;
-            auto distance = dot(offset, offset);
-            if (distance < closest_distance) {
-                c.current_operation = this;
-                closest_distance = distance;
-                index = i;
-            }
+            index = get_closest_vertex(c, old_position);
         }
     }
     void mouse_move_event(context &c, double x, double y) override {
         glm::vec2 position = to_canvas(c, {x, y});
         auto delta = position - old_position;
 
-        c.positions[index] += delta;
+        c.vertices_position[index] += delta;
 
         old_position = position;
     }
@@ -123,23 +164,53 @@ struct drag_operation : public operation {
     unsigned index;
 };
 
-struct add_vertex : public operation {
+struct extrude_vertex : public operation {
     void trigger(context& c, double x, double y) override {
-        glm::vec2 position = to_canvas(c, {x, y});
-        c.lines[c.lines_count++] = c.positions_count - 1;
-        c.lines[c.lines_count++] = c.positions_count;
-        c.positions[c.positions_count++] = position;
+        if (c.selection_count == 1) {
+            glm::vec2 position = to_canvas(c, {x, y});
+            c.lines_vertex[c.line_count++] = c.selection_vertex[0];
+            c.lines_vertex[c.line_count++] = c.vertex_count;
+
+            add_vertex(c);
+            c.vertices_position[c.vertex_count - 1] = position;
+        }
     }
     void mouse_move_event(context&, double, double) override {}
     void mouse_button_event(context&, int, int, int) override {}
     void key_event(context&, int, int, int) override {}
 };
 
+struct select_vertex : public operation {
+    void trigger(context &c, double x, double y) override {
+        if (c.vertex_count > 0) {
+            auto position = to_canvas(c, {x, y});
+            auto index = get_closest_vertex(c, position);
+            if (c.vertices_selection[index] < c.selection_count) {
+                c.selection_count--;
+                ge1::permutation_swap(
+                    c.selection_vertex, c.vertices_selection,
+                    c.selection_vertex[c.selection_count], index
+                );
+            } else {
+                ge1::permutation_swap(
+                    c.selection_vertex, c.vertices_selection,
+                    c.selection_vertex[c.selection_count], index
+                );
+                c.selection_count++;
+            }
+        }
+    }
+    void mouse_move_event(context &, double, double) override {};
+    void mouse_button_event(context &, int, int, int) override {};
+    void key_event(context &, int, int, int) override {};
+};
+
 static context* current_context;
 
 static pan_operation pan_operation;
 static drag_operation drag_operation;
-static add_vertex add_vertex_operation;
+static extrude_vertex extrude_vertex_operation;
+static select_vertex select_vertex_operation;
 
 void mouse_button_callback(
     GLFWwindow* window, int button, int action, int modifiers
@@ -153,21 +224,16 @@ void mouse_button_callback(
         double x, y;
         glfwGetCursorPos(window, &x, &y);
 
-        if (modifiers & GLFW_MOD_SHIFT) {
-
-        } else if (modifiers & GLFW_MOD_CONTROL) {
-            add_vertex_operation.trigger(*current_context, x, y);
-
-        } else if (modifiers & GLFW_MOD_ALT) {
-            if (button == GLFW_MOUSE_BUTTON_LEFT) {
-                // current_operation = &rotate_view_operation;
-            } else if (button == GLFW_MOUSE_BUTTON_MIDDLE) {
-                pan_operation.trigger(*current_context, x, y);
-            } else if (button == GLFW_MOUSE_BUTTON_RIGHT) {
-                // current_operation = &dolly_view_operation;
-            }
-        } else {
+        if (button == GLFW_MOUSE_BUTTON_LEFT && !modifiers) {
             drag_operation.trigger(*current_context, x, y);
+        } else if (
+            button == GLFW_MOUSE_BUTTON_LEFT && modifiers & GLFW_MOD_CONTROL
+        ) {
+            select_vertex_operation.trigger(*current_context, x, y);
+        } else if (button == GLFW_MOUSE_BUTTON_MIDDLE && !modifiers) {
+            pan_operation.trigger(*current_context, x, y);
+        } else if (button == GLFW_MOUSE_BUTTON_RIGHT) {
+
         }
     }
 }
@@ -177,6 +243,28 @@ void cursor_position_callback(GLFWwindow*, double x, double y) {
         current_context->current_operation->mouse_move_event(
             *current_context, x, y
         );
+    }
+}
+
+void key_callback(
+    GLFWwindow* window, int key, int scancode, int action, int modifiers
+) {
+    if (current_context->current_operation) {
+        current_context->current_operation->key_event(
+            *current_context, key, scancode, modifiers
+        );
+
+    } else {
+        double x, y;
+        glfwGetCursorPos(window, &x, &y);
+
+        if (action == GLFW_PRESS) {
+            if (key == GLFW_KEY_E) {
+                extrude_vertex_operation.trigger(*current_context, x, y);
+            } else if (key == GLFW_KEY_DELETE) {
+
+            }
+        }
     }
 }
 
@@ -228,41 +316,78 @@ int main() {
     }
 
     enum : GLuint {
-        position,
+        position, selected,
     };
 
-    GLuint position_buffer, line_buffer;
+    GLuint position_buffer, selection_buffer, line_buffer;
 
-    unsigned position_capacity = 1024;
+    unsigned vertex_capacity = 1024;
     unsigned line_capacity = 1024;
 
     ge1::unique_vertex_array line_array = ge1::create_vertex_array(
-        position_capacity,
-        {{
-            {{position, 2, GL_FLOAT, GL_FALSE, 0}},
-            0, GL_DYNAMIC_DRAW, &position_buffer
-        }},
-        line_capacity, &line_buffer, GL_UNSIGNED_SHORT
+        vertex_capacity, {
+            {
+                {{position, 2, GL_FLOAT, GL_FALSE, 0}},
+                0, GL_DYNAMIC_DRAW, &position_buffer
+            }, {
+                // TODO
+                {{selected, 1, GL_UNSIGNED_SHORT, GL_FALSE, 0}},
+                0, GL_DYNAMIC_DRAW, &selection_buffer
+            },
+        }, line_capacity, &line_buffer, GL_UNSIGNED_SHORT
     );
+    glBindBuffer(GL_ARRAY_BUFFER, selection_buffer);
+    glVertexAttribIPointer(selected, 1, GL_UNSIGNED_SHORT, 0, 0);
+
+    ge1::unique_vertex_array vertex_array = ge1::create_vertex_array(
+        {
+            {position_buffer, position, 2, GL_FLOAT, GL_FALSE, 0, 0},
+        }
+    );
+    glBindBuffer(GL_ARRAY_BUFFER, selection_buffer);
+    glEnableVertexAttribArray(selected);
+    glVertexAttribIPointer(selected, 1, GL_UNSIGNED_SHORT, 0, 0);
 
     glBindBuffer(GL_COPY_WRITE_BUFFER, position_buffer);
     glBufferStorage(
-        GL_COPY_WRITE_BUFFER, position_capacity * sizeof(glm::vec2), nullptr,
+        GL_COPY_WRITE_BUFFER, vertex_capacity * sizeof(glm::vec2), nullptr,
         GL_MAP_COHERENT_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_WRITE_BIT
     );
     {
         auto positions = reinterpret_cast<glm::vec2*>(glMapBufferRange(
-            GL_COPY_WRITE_BUFFER, 0, position_capacity * sizeof(glm::vec2),
+            GL_COPY_WRITE_BUFFER, 0, vertex_capacity * sizeof(glm::vec2),
             GL_MAP_COHERENT_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_WRITE_BIT
         ));
-        c.positions = {positions, positions + position_capacity};
+        c.vertices_position = {positions, positions + vertex_capacity};
     }
 
-    c.positions[0] = {0, 0};
-    c.positions[1] = {0.1, 0.1};
-    c.positions[2] = {0.2, 0.1};
+    glBindBuffer(GL_COPY_WRITE_BUFFER, selection_buffer);
+    glBufferStorage(
+        GL_COPY_WRITE_BUFFER, vertex_capacity * sizeof(unsigned short),
+        nullptr,
+        GL_MAP_COHERENT_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_WRITE_BIT
+    );
+    {
+        auto selected = reinterpret_cast<unsigned short*>(glMapBufferRange(
+            GL_COPY_WRITE_BUFFER, 0, vertex_capacity * sizeof(unsigned short),
+            GL_MAP_COHERENT_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_WRITE_BIT
+        ));
+        c.vertices_selection = {selected, selected + vertex_capacity};
+    }
 
-    c.positions_count = 3;
+
+    c.selection_vertex = ge1::span<unsigned short>(vertex_capacity);
+    c.vertex_count = 0;
+    c.line_count = 0;
+    c.selection_count = 0;
+
+    for (auto i = 0u; i < 3; i++) {
+        add_vertex(c);
+    }
+
+    c.vertices_position[0] = {0, 0};
+    c.vertices_position[1] = {0.1, 0.1};
+    c.vertices_position[2] = {0.2, 0.1};
 
     glBindBuffer(GL_COPY_WRITE_BUFFER, line_buffer);
     glBufferStorage(
@@ -274,19 +399,15 @@ int main() {
             GL_COPY_WRITE_BUFFER, 0, line_capacity * sizeof(unsigned short),
             GL_MAP_COHERENT_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_WRITE_BIT
         ));
-        c.lines = {lines, lines + line_capacity};
+        c.lines_vertex = {lines, lines + line_capacity};
     }
 
-    c.positions[0] = {0, 0};
-    c.positions[1] = {0.1, 0.1};
-    c.positions[2] = {0.2, 0.1};
+    c.lines_vertex[0] = 0;
+    c.lines_vertex[1] = 1;
+    c.lines_vertex[2] = 1;
+    c.lines_vertex[3] = 2;
 
-    c.lines[0] = 0;
-    c.lines[1] = 1;
-    c.lines[2] = 1;
-    c.lines[3] = 2;
-
-    c.lines_count = 4;
+    c.line_count = 4;
 
     enum : GLuint {
         position_location,
@@ -298,11 +419,16 @@ int main() {
         {{"position", position_location}}
     );
 
-    GLuint view_matrix_location;
+    GLuint view_matrix_location, selection_count_location;
 
     ge1::get_uniform_locations(
-        program.get_name(), {{"view_matrix", &view_matrix_location}}
+        program.get_name(), {
+            {"view_matrix", &view_matrix_location},
+            {"selection_count", &selection_count_location},
+        }
     );
+
+    glPointSize(10.0f);
 
     current_context = &c;
     c.current_operation = nullptr;
@@ -310,6 +436,7 @@ int main() {
 
     glfwSetCursorPosCallback(window, &cursor_position_callback);
     glfwSetMouseButtonCallback(window, &mouse_button_callback);
+    glfwSetKeyCallback(window, &key_callback);
     glfwSetWindowSizeCallback(window, &window_size_callback);
 
     int width, height;
@@ -327,20 +454,23 @@ int main() {
 
     while (!glfwWindowShouldClose(window)) {
         glClearColor(255, 255, 255, 255);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glClear(GL_COLOR_BUFFER_BIT);
 
         glUseProgram(program.get_name());
         glUniformMatrix3x2fv(
             view_matrix_location, 1, GL_FALSE, glm::value_ptr(c.view_matrix)
         );
+        glUniform1ui(selection_count_location, c.selection_count);
         glBindVertexArray(line_array.get_name());
-        glDrawElements(GL_LINES, c.lines_count, GL_UNSIGNED_SHORT, 0);
+        glDrawElements(GL_LINES, c.line_count, GL_UNSIGNED_SHORT, 0);
+        glBindVertexArray(vertex_array.get_name());
+        glDrawArrays(GL_POINTS, 0, c.vertex_count);
 
         glFinish();
 
         glfwSwapBuffers(window);
 
-        glfwPollEvents();
+        glfwWaitEvents();
     }
 
     return 0;
